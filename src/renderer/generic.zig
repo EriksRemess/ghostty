@@ -1917,6 +1917,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                     &self.api,
                     self.shaders.pipelines.image,
                     &pass,
+                    frame.uniforms.buffer,
                     .kitty_below_bg,
                 );
 
@@ -1933,6 +1934,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                     &self.api,
                     self.shaders.pipelines.image,
                     &pass,
+                    frame.uniforms.buffer,
                     .kitty_below_text,
                 );
 
@@ -1960,6 +1962,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                     &self.api,
                     self.shaders.pipelines.image,
                     &pass,
+                    frame.uniforms.buffer,
                     .kitty_above_text,
                 );
 
@@ -1969,6 +1972,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                     &self.api,
                     self.shaders.pipelines.image,
                     &pass,
+                    frame.uniforms.buffer,
                     .overlay,
                 );
             }
