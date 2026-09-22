@@ -1,46 +1,41 @@
 const std = @import("std");
-const c = @import("api.zig").c;
+const vk = @import("api.zig").vk;
 const Context = @import("Context.zig");
 
 pub const Options = struct {
     context: *Context,
-    usage: c.VkBufferUsageFlags,
+    usage: vk.BufferUsageFlags,
 };
 
 pub const Handle = struct {
     context: *Context,
-    buffer: c.VkBuffer,
-    memory: c.VkDeviceMemory,
+    buffer: vk.Buffer,
+    memory: vk.DeviceMemory,
     size: usize,
     deferred: *Context.DeferredBuffer,
 
     pub fn init(opts: Options, size_: usize) !Handle {
         const size = @max(size_, 1);
-        var info = std.mem.zeroes(c.VkBufferCreateInfo);
-        info.sType = c.VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
-        info.size = size;
-        info.usage = opts.usage;
-        info.sharingMode = c.VK_SHARING_MODE_EXCLUSIVE;
+        const info: vk.BufferCreateInfo = .{
+            .size = size,
+            .usage = opts.usage,
+            .sharing_mode = .exclusive,
+        };
+        const buffer = try opts.context.device.createBuffer(&info, null);
+        errdefer opts.context.device.destroyBuffer(buffer, null);
 
-        var buffer: c.VkBuffer = null;
-        try Context.result(c.vkCreateBuffer(opts.context.device, &info, null, &buffer));
-        errdefer c.vkDestroyBuffer(opts.context.device, buffer, null);
+        const requirements = opts.context.device.getBufferMemoryRequirements(buffer);
+        const alloc_info: vk.MemoryAllocateInfo = .{
+            .allocation_size = requirements.size,
+            .memory_type_index = try opts.context.memoryType(
+                requirements.memory_type_bits,
+                .{ .host_visible_bit = true, .host_coherent_bit = true },
+            ),
+        };
 
-        var requirements = std.mem.zeroes(c.VkMemoryRequirements);
-        c.vkGetBufferMemoryRequirements(opts.context.device, buffer, &requirements);
-
-        var alloc_info = std.mem.zeroes(c.VkMemoryAllocateInfo);
-        alloc_info.sType = c.VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
-        alloc_info.allocationSize = requirements.size;
-        alloc_info.memoryTypeIndex = try opts.context.memoryType(
-            requirements.memoryTypeBits,
-            c.VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | c.VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
-        );
-
-        var memory: c.VkDeviceMemory = null;
-        try Context.result(c.vkAllocateMemory(opts.context.device, &alloc_info, null, &memory));
-        errdefer c.vkFreeMemory(opts.context.device, memory, null);
-        try Context.result(c.vkBindBufferMemory(opts.context.device, buffer, memory, 0));
+        const memory = try opts.context.device.allocateMemory(&alloc_info, null);
+        errdefer opts.context.device.freeMemory(memory, null);
+        try opts.context.device.bindBufferMemory(buffer, memory, 0);
 
         const deferred = try opts.context.alloc.create(Context.DeferredBuffer);
         errdefer opts.context.alloc.destroy(deferred);
@@ -56,21 +51,20 @@ pub const Handle = struct {
     }
 
     pub fn deinit(self: Handle) void {
+        // Buffers may still be referenced by the command buffer currently
+        // being recorded. Context frees them after the next submission fence.
         self.context.deferBuffer(self.deferred);
     }
 
     pub fn write(self: Handle, offset: usize, bytes: []const u8) !void {
         if (offset + bytes.len > self.size) return error.BufferOverflow;
-        var mapped: ?*anyopaque = null;
-        try Context.result(c.vkMapMemory(
-            self.context.device,
+        const mapped = try self.context.device.mapMemory(
             self.memory,
             offset,
             bytes.len,
-            0,
-            &mapped,
-        ));
-        defer c.vkUnmapMemory(self.context.device, self.memory);
+            .{},
+        );
+        defer self.context.device.unmapMemory(self.memory);
         const dst: [*]u8 = @ptrCast(mapped.?);
         @memcpy(dst[0..bytes.len], bytes);
     }

@@ -1,7 +1,6 @@
 const Self = @This();
 
-const std = @import("std");
-const c = @import("api.zig").c;
+const vk = @import("api.zig").vk;
 const Context = @import("Context.zig");
 const bufferpkg = @import("buffer.zig");
 
@@ -9,93 +8,89 @@ pub const PixelFormat = enum { gray, rgba, bgra };
 
 pub const Options = struct {
     context: *Context,
-    format: c.VkFormat,
+    format: vk.Format,
     upload_format: PixelFormat,
-    min_filter: c.VkFilter,
-    mag_filter: c.VkFilter,
-    address_mode: c.VkSamplerAddressMode,
+    min_filter: vk.Filter,
+    mag_filter: vk.Filter,
+    address_mode: vk.SamplerAddressMode,
     unnormalized_coordinates: bool = false,
 };
 
 context: *Context,
-image: c.VkImage,
-memory: c.VkDeviceMemory,
-view: c.VkImageView,
-sampler: c.VkSampler,
+image: vk.Image,
+memory: vk.DeviceMemory,
+view: vk.ImageView,
+sampler: vk.Sampler,
 width: usize,
 height: usize,
-format: c.VkFormat,
+format: vk.Format,
 upload_format: PixelFormat,
 
 pub const Error = anyerror;
 
 pub fn init(opts: Options, width: usize, height: usize, data: ?[]const u8) Error!Self {
-    var image_info = std.mem.zeroes(c.VkImageCreateInfo);
-    image_info.sType = c.VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
-    image_info.imageType = c.VK_IMAGE_TYPE_2D;
-    image_info.format = opts.format;
-    image_info.extent = .{ .width = @intCast(width), .height = @intCast(height), .depth = 1 };
-    image_info.mipLevels = 1;
-    image_info.arrayLayers = 1;
-    image_info.samples = c.VK_SAMPLE_COUNT_1_BIT;
-    image_info.tiling = c.VK_IMAGE_TILING_OPTIMAL;
-    image_info.usage = c.VK_IMAGE_USAGE_SAMPLED_BIT |
-        c.VK_IMAGE_USAGE_TRANSFER_DST_BIT |
-        c.VK_IMAGE_USAGE_TRANSFER_SRC_BIT |
-        c.VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
-    image_info.sharingMode = c.VK_SHARING_MODE_EXCLUSIVE;
-    image_info.initialLayout = c.VK_IMAGE_LAYOUT_UNDEFINED;
+    const image = try opts.context.device.createImage(&.{
+        .image_type = .@"2d",
+        .format = opts.format,
+        .extent = .{ .width = @intCast(width), .height = @intCast(height), .depth = 1 },
+        .mip_levels = 1,
+        .array_layers = 1,
+        .samples = .{ .@"1_bit" = true },
+        .tiling = .optimal,
+        .usage = .{
+            .sampled_bit = true,
+            .transfer_dst_bit = true,
+            .transfer_src_bit = true,
+            .color_attachment_bit = true,
+        },
+        .sharing_mode = .exclusive,
+        .initial_layout = .undefined,
+    }, null);
+    errdefer opts.context.device.destroyImage(image, null);
 
-    var image: c.VkImage = null;
-    try Context.result(c.vkCreateImage(opts.context.device, &image_info, null, &image));
-    errdefer c.vkDestroyImage(opts.context.device, image, null);
+    const requirements = opts.context.device.getImageMemoryRequirements(image);
+    const memory = try opts.context.device.allocateMemory(&.{
+        .allocation_size = requirements.size,
+        .memory_type_index = try opts.context.memoryType(
+            requirements.memory_type_bits,
+            .{ .device_local_bit = true },
+        ),
+    }, null);
+    errdefer opts.context.device.freeMemory(memory, null);
+    try opts.context.device.bindImageMemory(image, memory, 0);
 
-    var requirements = std.mem.zeroes(c.VkMemoryRequirements);
-    c.vkGetImageMemoryRequirements(opts.context.device, image, &requirements);
-    var alloc_info = std.mem.zeroes(c.VkMemoryAllocateInfo);
-    alloc_info.sType = c.VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
-    alloc_info.allocationSize = requirements.size;
-    alloc_info.memoryTypeIndex = try opts.context.memoryType(
-        requirements.memoryTypeBits,
-        c.VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
-    );
+    const view = try opts.context.device.createImageView(&.{
+        .image = image,
+        .view_type = .@"2d",
+        .format = opts.format,
+        .components = .{
+            .r = .identity,
+            .g = .identity,
+            .b = .identity,
+            .a = .identity,
+        },
+        .subresource_range = colorRange(),
+    }, null);
+    errdefer opts.context.device.destroyImageView(view, null);
 
-    var memory: c.VkDeviceMemory = null;
-    try Context.result(c.vkAllocateMemory(opts.context.device, &alloc_info, null, &memory));
-    errdefer c.vkFreeMemory(opts.context.device, memory, null);
-    try Context.result(c.vkBindImageMemory(opts.context.device, image, memory, 0));
-
-    var view_info = std.mem.zeroes(c.VkImageViewCreateInfo);
-    view_info.sType = c.VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
-    view_info.image = image;
-    view_info.viewType = c.VK_IMAGE_VIEW_TYPE_2D;
-    view_info.format = opts.format;
-    view_info.components = .{
-        .r = c.VK_COMPONENT_SWIZZLE_IDENTITY,
-        .g = c.VK_COMPONENT_SWIZZLE_IDENTITY,
-        .b = c.VK_COMPONENT_SWIZZLE_IDENTITY,
-        .a = c.VK_COMPONENT_SWIZZLE_IDENTITY,
-    };
-    view_info.subresourceRange = colorRange();
-
-    var view: c.VkImageView = null;
-    try Context.result(c.vkCreateImageView(opts.context.device, &view_info, null, &view));
-    errdefer c.vkDestroyImageView(opts.context.device, view, null);
-
-    var sampler_info = std.mem.zeroes(c.VkSamplerCreateInfo);
-    sampler_info.sType = c.VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO;
-    sampler_info.magFilter = opts.mag_filter;
-    sampler_info.minFilter = opts.min_filter;
-    sampler_info.mipmapMode = c.VK_SAMPLER_MIPMAP_MODE_NEAREST;
-    sampler_info.addressModeU = opts.address_mode;
-    sampler_info.addressModeV = opts.address_mode;
-    sampler_info.addressModeW = opts.address_mode;
-    sampler_info.maxLod = 0;
-    sampler_info.unnormalizedCoordinates = if (opts.unnormalized_coordinates) c.VK_TRUE else c.VK_FALSE;
-
-    var sampler: c.VkSampler = null;
-    try Context.result(c.vkCreateSampler(opts.context.device, &sampler_info, null, &sampler));
-    errdefer c.vkDestroySampler(opts.context.device, sampler, null);
+    const sampler = try opts.context.device.createSampler(&.{
+        .mag_filter = opts.mag_filter,
+        .min_filter = opts.min_filter,
+        .mipmap_mode = .nearest,
+        .address_mode_u = opts.address_mode,
+        .address_mode_v = opts.address_mode,
+        .address_mode_w = opts.address_mode,
+        .mip_lod_bias = 0,
+        .anisotropy_enable = .false,
+        .max_anisotropy = 0,
+        .compare_enable = .false,
+        .compare_op = .never,
+        .min_lod = 0,
+        .max_lod = 0,
+        .border_color = .float_transparent_black,
+        .unnormalized_coordinates = if (opts.unnormalized_coordinates) .true else .false,
+    }, null);
+    errdefer opts.context.device.destroySampler(sampler, null);
 
     var self: Self = .{
         .context = opts.context,
@@ -114,47 +109,51 @@ pub fn init(opts: Options, width: usize, height: usize, data: ?[]const u8) Error
 }
 
 pub fn deinit(self: Self) void {
-    c.vkDestroySampler(self.context.device, self.sampler, null);
-    c.vkDestroyImageView(self.context.device, self.view, null);
-    c.vkDestroyImage(self.context.device, self.image, null);
-    c.vkFreeMemory(self.context.device, self.memory, null);
+    self.context.device.destroySampler(self.sampler, null);
+    self.context.device.destroyImageView(self.view, null);
+    self.context.device.destroyImage(self.image, null);
+    self.context.device.freeMemory(self.memory, null);
 }
 
 pub fn replaceRegion(self: Self, x: usize, y: usize, width: usize, height: usize, data: []const u8) Error!void {
     const staging = try bufferpkg.Handle.init(.{
         .context = self.context,
-        .usage = c.VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+        .usage = .{ .transfer_src_bit = true },
     }, data.len);
     defer staging.deinit();
     try staging.write(0, data);
 
     const command_buffer = try self.context.beginCommands();
-    var region = std.mem.zeroes(c.VkBufferImageCopy);
-    region.imageSubresource = .{
-        .aspectMask = c.VK_IMAGE_ASPECT_COLOR_BIT,
-        .mipLevel = 0,
-        .baseArrayLayer = 0,
-        .layerCount = 1,
+    const region: vk.BufferImageCopy = .{
+        .buffer_offset = 0,
+        .buffer_row_length = 0,
+        .buffer_image_height = 0,
+        .image_subresource = .{
+            .aspect_mask = .{ .color_bit = true },
+            .mip_level = 0,
+            .base_array_layer = 0,
+            .layer_count = 1,
+        },
+        .image_offset = .{ .x = @intCast(x), .y = @intCast(y), .z = 0 },
+        .image_extent = .{ .width = @intCast(width), .height = @intCast(height), .depth = 1 },
     };
-    region.imageOffset = .{ .x = @intCast(x), .y = @intCast(y), .z = 0 };
-    region.imageExtent = .{ .width = @intCast(width), .height = @intCast(height), .depth = 1 };
-    c.vkCmdCopyBufferToImage(
+    self.context.device.cmdCopyBufferToImage(
         command_buffer,
         staging.buffer,
         self.image,
-        c.VK_IMAGE_LAYOUT_GENERAL,
-        1,
-        &region,
+        .general,
+        @ptrCast(&region),
     );
     imageBarrier(
+        self.context,
         command_buffer,
         self.image,
-        c.VK_ACCESS_TRANSFER_WRITE_BIT,
-        c.VK_ACCESS_SHADER_READ_BIT,
-        c.VK_PIPELINE_STAGE_TRANSFER_BIT,
-        c.VK_PIPELINE_STAGE_ALL_GRAPHICS_BIT,
-        c.VK_IMAGE_LAYOUT_GENERAL,
-        c.VK_IMAGE_LAYOUT_GENERAL,
+        .{ .transfer_write_bit = true },
+        .{ .shader_read_bit = true },
+        .{ .transfer_bit = true },
+        .{ .all_graphics_bit = true },
+        .general,
+        .general,
     );
     try self.context.submitCommands(command_buffer);
 }
@@ -162,59 +161,61 @@ pub fn replaceRegion(self: Self, x: usize, y: usize, width: usize, height: usize
 fn initialize(self: *Self, data: ?[]const u8) !void {
     const command_buffer = try self.context.beginCommands();
     imageBarrier(
+        self.context,
         command_buffer,
         self.image,
-        0,
-        if (data == null) c.VK_ACCESS_SHADER_READ_BIT else c.VK_ACCESS_TRANSFER_WRITE_BIT,
-        c.VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
-        if (data == null) c.VK_PIPELINE_STAGE_ALL_GRAPHICS_BIT else c.VK_PIPELINE_STAGE_TRANSFER_BIT,
-        c.VK_IMAGE_LAYOUT_UNDEFINED,
-        c.VK_IMAGE_LAYOUT_GENERAL,
+        .{},
+        if (data == null) .{ .shader_read_bit = true } else .{ .transfer_write_bit = true },
+        .{ .top_of_pipe_bit = true },
+        if (data == null) .{ .all_graphics_bit = true } else .{ .transfer_bit = true },
+        // Textures remain in GENERAL for their lifetime. This trades some
+        // layout-specific optimization for much simpler mixed render/sample/
+        // transfer use across the generic renderer's passes.
+        .undefined,
+        .general,
     );
     try self.context.submitCommands(command_buffer);
     if (data) |bytes| try self.replaceRegion(0, 0, self.width, self.height, bytes);
 }
 
-pub fn colorRange() c.VkImageSubresourceRange {
+pub fn colorRange() vk.ImageSubresourceRange {
     return .{
-        .aspectMask = c.VK_IMAGE_ASPECT_COLOR_BIT,
-        .baseMipLevel = 0,
-        .levelCount = 1,
-        .baseArrayLayer = 0,
-        .layerCount = 1,
+        .aspect_mask = .{ .color_bit = true },
+        .base_mip_level = 0,
+        .level_count = 1,
+        .base_array_layer = 0,
+        .layer_count = 1,
     };
 }
 
 pub fn imageBarrier(
-    command_buffer: c.VkCommandBuffer,
-    image: c.VkImage,
-    src_access: c.VkAccessFlags,
-    dst_access: c.VkAccessFlags,
-    src_stage: c.VkPipelineStageFlags,
-    dst_stage: c.VkPipelineStageFlags,
-    old_layout: c.VkImageLayout,
-    new_layout: c.VkImageLayout,
+    context: *Context,
+    command_buffer: vk.CommandBuffer,
+    image: vk.Image,
+    src_access: vk.AccessFlags,
+    dst_access: vk.AccessFlags,
+    src_stage: vk.PipelineStageFlags,
+    dst_stage: vk.PipelineStageFlags,
+    old_layout: vk.ImageLayout,
+    new_layout: vk.ImageLayout,
 ) void {
-    var barrier = std.mem.zeroes(c.VkImageMemoryBarrier);
-    barrier.sType = c.VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
-    barrier.srcAccessMask = src_access;
-    barrier.dstAccessMask = dst_access;
-    barrier.oldLayout = old_layout;
-    barrier.newLayout = new_layout;
-    barrier.srcQueueFamilyIndex = c.VK_QUEUE_FAMILY_IGNORED;
-    barrier.dstQueueFamilyIndex = c.VK_QUEUE_FAMILY_IGNORED;
-    barrier.image = image;
-    barrier.subresourceRange = colorRange();
-    c.vkCmdPipelineBarrier(
+    const barrier: vk.ImageMemoryBarrier = .{
+        .src_access_mask = src_access,
+        .dst_access_mask = dst_access,
+        .old_layout = old_layout,
+        .new_layout = new_layout,
+        .src_queue_family_index = vk.QUEUE_FAMILY_IGNORED,
+        .dst_queue_family_index = vk.QUEUE_FAMILY_IGNORED,
+        .image = image,
+        .subresource_range = colorRange(),
+    };
+    context.device.cmdPipelineBarrier(
         command_buffer,
         src_stage,
         dst_stage,
-        0,
-        0,
+        .{},
         null,
-        0,
         null,
-        1,
-        &barrier,
+        @ptrCast(&barrier),
     );
 }

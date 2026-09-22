@@ -1,5 +1,5 @@
 const std = @import("std");
-const c = @import("api.zig").c;
+const vk = @import("api.zig").vk;
 const Context = @import("Context.zig");
 const shadertoy = @import("../shadertoy.zig");
 
@@ -10,7 +10,7 @@ pub fn module(
     alloc: std.mem.Allocator,
     source: [:0]const u8,
     stage: shadertoy.ShaderStage,
-) !c.VkShaderModule {
+) !vk.ShaderModule {
     const transformed = try transform(alloc, source);
     defer alloc.free(transformed);
 
@@ -26,16 +26,15 @@ pub fn module(
     const bytes = output.written();
     if (bytes.len % @sizeOf(u32) != 0) return error.InvalidSpirv;
 
-    var info = std.mem.zeroes(c.VkShaderModuleCreateInfo);
-    info.sType = c.VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO;
-    info.codeSize = bytes.len;
-    info.pCode = @ptrCast(@alignCast(bytes.ptr));
-    var result: c.VkShaderModule = null;
-    try Context.result(c.vkCreateShaderModule(context.device, &info, null, &result));
-    return result;
+    return context.device.createShaderModule(&.{
+        .code_size = bytes.len,
+        .p_code = @ptrCast(@alignCast(bytes.ptr)),
+    }, null);
 }
 
 fn transform(alloc: std.mem.Allocator, source: [:0]const u8) ![:0]u8 {
+    // The shared shader sources use OpenGL bindings and builtins. Keep the
+    // source canonical and adapt those declarations before compiling SPIR-V.
     var value = try alloc.dupeZ(u8, source);
     errdefer alloc.free(value);
 

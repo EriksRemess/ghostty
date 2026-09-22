@@ -40,6 +40,18 @@
             .hash = "zig_js-0.0.0-rjCAV7-GAADvMTBL7lPMuvDk7xgS9PCMIZWiOUXLZSlj",
             .lazy = true,
         },
+        .vulkan_zig = .{
+            // Snektron/vulkan-zig zig-0.16-compat
+            .url = "git+https://github.com/Snektron/vulkan-zig#b496a6a561ffbbeb530b0f9ed4e059f88c0723a5",
+            .hash = "vulkan-0.0.0-r7Ytx7N9AwD7IZt5_XNHtkJ4G9qY0pCH-cpcOsbL8wzD",
+            .lazy = true,
+        },
+        .vulkan_headers = .{
+            // KhronosGroup/Vulkan-Headers, used as vulkan-zig's registry.
+            .url = "git+https://github.com/KhronosGroup/Vulkan-Headers#6802bb4733b63ed5efd3adb308a6c885ef180ea1",
+            .hash = "N-V-__8AAGluhwIkfWs_S_i5ctSYH58cXuq_SYTNZ0nVUUlN",
+            .lazy = true,
+        },
         .uucode = .{
             // jacobsandlund/uucode
             .url = "https://github.com/jacobsandlund/uucode/archive/9d55524551411b493cca41ca06363625d90aff1e.tar.gz",

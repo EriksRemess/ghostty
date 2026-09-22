@@ -1,37 +1,41 @@
 const Self = @This();
 
-const std = @import("std");
-const c = @import("api.zig").c;
+const vk = @import("api.zig").vk;
 const Context = @import("Context.zig");
 
 pub const Options = struct {
     context: *Context,
-    min_filter: c.VkFilter,
-    mag_filter: c.VkFilter,
-    address_mode: c.VkSamplerAddressMode,
+    min_filter: vk.Filter,
+    mag_filter: vk.Filter,
+    address_mode: vk.SamplerAddressMode,
 };
 
 context: *Context,
-sampler: c.VkSampler,
+sampler: vk.Sampler,
 
 pub const Error = anyerror;
 
 pub fn init(opts: Options) Error!Self {
-    var info = std.mem.zeroes(c.VkSamplerCreateInfo);
-    info.sType = c.VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO;
-    info.magFilter = opts.mag_filter;
-    info.minFilter = opts.min_filter;
-    info.mipmapMode = c.VK_SAMPLER_MIPMAP_MODE_NEAREST;
-    info.addressModeU = opts.address_mode;
-    info.addressModeV = opts.address_mode;
-    info.addressModeW = opts.address_mode;
-    info.maxLod = 0;
-
-    var sampler: c.VkSampler = null;
-    try Context.result(c.vkCreateSampler(opts.context.device, &info, null, &sampler));
+    const sampler = try opts.context.device.createSampler(&.{
+        .mag_filter = opts.mag_filter,
+        .min_filter = opts.min_filter,
+        .mipmap_mode = .nearest,
+        .address_mode_u = opts.address_mode,
+        .address_mode_v = opts.address_mode,
+        .address_mode_w = opts.address_mode,
+        .mip_lod_bias = 0,
+        .anisotropy_enable = .false,
+        .max_anisotropy = 0,
+        .compare_enable = .false,
+        .compare_op = .never,
+        .min_lod = 0,
+        .max_lod = 0,
+        .border_color = .float_transparent_black,
+        .unnormalized_coordinates = .false,
+    }, null);
     return .{ .context = opts.context, .sampler = sampler };
 }
 
 pub fn deinit(self: Self) void {
-    c.vkDestroySampler(self.context.device, self.sampler, null);
+    self.context.device.destroySampler(self.sampler, null);
 }

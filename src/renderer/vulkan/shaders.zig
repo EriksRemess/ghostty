@@ -1,5 +1,5 @@
 const std = @import("std");
-const c = @import("api.zig").c;
+const vk = @import("api.zig").vk;
 const Context = @import("Context.zig");
 const Pipeline = @import("Pipeline.zig");
 const base = @import("../opengl/shaders.zig");
@@ -18,10 +18,10 @@ const PipelineDescription = struct {
     vertex_fn: [:0]const u8,
     fragment_fn: [:0]const u8,
     step_fn: Pipeline.Options.StepFunction = .per_vertex,
-    topology: c.VkPrimitiveTopology = c.VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST,
+    topology: vk.PrimitiveTopology = .triangle_list,
     blending_enabled: bool = true,
 
-    fn initPipeline(self: PipelineDescription, context: *Context, format: c.VkFormat) !Pipeline {
+    fn initPipeline(self: PipelineDescription, context: *Context, format: vk.Format) !Pipeline {
         return Pipeline.init(self.vertex_attributes, .{
             .context = context,
             .vertex_fn = self.vertex_fn,
@@ -49,14 +49,14 @@ const pipeline_descs: []const struct { [:0]const u8, PipelineDescription } = &.{
         .vertex_fn = loadShaderCode("../shaders/glsl/cell_text.v.glsl"),
         .fragment_fn = loadShaderCode("../shaders/glsl/cell_text.f.glsl"),
         .step_fn = .per_instance,
-        .topology = c.VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP,
+        .topology = .triangle_strip,
     } },
     .{ "image", .{
         .vertex_attributes = Image,
         .vertex_fn = loadShaderCode("../shaders/glsl/image.v.glsl"),
         .fragment_fn = loadShaderCode("../shaders/glsl/image.f.glsl"),
         .step_fn = .per_instance,
-        .topology = c.VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP,
+        .topology = .triangle_strip,
     } },
     .{ "bg_image", .{
         .vertex_attributes = BgImage,
@@ -90,7 +90,7 @@ pub const Shaders = struct {
         alloc: std.mem.Allocator,
         context: *Context,
         post_shaders: []const [:0]const u8,
-        format: c.VkFormat,
+        format: vk.Format,
     ) !Shaders {
         var pipelines: PipelineCollection = undefined;
         var initialized: usize = 0;
@@ -128,7 +128,7 @@ fn initPostPipelines(
     alloc: std.mem.Allocator,
     context: *Context,
     sources: []const [:0]const u8,
-    format: c.VkFormat,
+    format: vk.Format,
 ) ![]const Pipeline {
     if (sources.len == 0) return &.{};
     const pipelines = try alloc.alloc(Pipeline, sources.len);
