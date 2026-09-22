@@ -618,6 +618,13 @@ pub const Surface = extern struct {
         /// grabbing focus only work if a widget is mapped.
         mapped: bool = false,
 
+        /// Defers reporting an unmap as occlusion until the next main-loop
+        /// idle. Rebuilding a split tree reparents its existing surfaces,
+        /// which emits an unmap/map pair in the same iteration. Treating that
+        /// transient unmap as real occlusion needlessly destroys the renderer
+        /// swap chain and causes a blank frame during the transition.
+        occlusion_idle: ?c_uint = null,
+
         /// Whether this surface is "zoomed" or not. A zoomed surface
         /// shows up taking the full bounds of a split view.
         zoom: bool = false,
@@ -1919,6 +1926,13 @@ pub const Surface = extern struct {
                 log.warn("unable to remove idle source", .{});
             }
             priv.idle_rechild = null;
+        }
+
+        if (priv.occlusion_idle) |v| {
+            if (glib.Source.remove(v) == 0) {
+                log.warn("unable to remove occlusion idle source", .{});
+            }
+            priv.occlusion_idle = null;
         }
 
         if (priv.pending_horizontal_scroll_reset) |v| {
@@ -3345,6 +3359,12 @@ pub const Surface = extern struct {
         _: *RenderSurface,
         self: *Self,
     ) callconv(.c) void {
+        const priv = self.private();
+        if (priv.occlusion_idle) |source| {
+            _ = glib.Source.remove(source);
+            priv.occlusion_idle = null;
+        }
+
         self.updateMapped(true);
         self.updateOcclusion();
     }
@@ -3354,7 +3374,22 @@ pub const Surface = extern struct {
         self: *Self,
     ) callconv(.c) void {
         self.updateMapped(false);
+
+        // GTK reparents existing widgets when the split tree changes. That
+        // produces a transient unmap followed by a map in the same main-loop
+        // iteration. Wait until idle so renderSurfaceMap can cancel this and
+        // keep the existing swap chain alive through the layout transition.
+        const priv = self.private();
+        if (priv.occlusion_idle == null) {
+            priv.occlusion_idle = glib.idleAdd(renderSurfaceOcclusionIdle, self);
+        }
+    }
+
+    fn renderSurfaceOcclusionIdle(ud: ?*anyopaque) callconv(.c) c_int {
+        const self: *Self = @ptrCast(@alignCast(ud orelse return 0));
+        self.private().occlusion_idle = null;
         self.updateOcclusion();
+        return 0;
     }
 
     fn updateMapped(self: *Self, mapped: bool) void {

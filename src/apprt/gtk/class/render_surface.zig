@@ -96,16 +96,30 @@ pub const RenderSurface = extern struct {
     }
 
     fn unrealize(self: *Self) callconv(.c) void {
+        // Keep the last texture across unrealize/realize cycles. GTK
+        // temporarily unrealizes a surface while rebuilding the split tree;
+        // dropping the texture here makes that transition flash blank before
+        // the renderer can produce a frame at the new size. The texture stays
+        // valid across widget realization and is released in dispose or
+        // replaced by the next completed frame.
+        gtk.Widget.virtual_methods.unrealize.call(
+            Class.parent,
+            self.as(gtk.Widget),
+        );
+    }
+
+    fn dispose(self: *Self) callconv(.c) void {
         const priv = self.private();
 
         if (priv.texture) |tex| {
             tex.as(gobject.Object).unref();
             priv.texture = null;
         }
+        priv.core_surface = null;
 
-        gtk.Widget.virtual_methods.unrealize.call(
+        gobject.Object.virtual_methods.dispose.call(
             Class.parent,
-            self.as(gtk.Widget),
+            self.as(Parent),
         );
     }
 
@@ -144,9 +158,26 @@ pub const RenderSurface = extern struct {
         // currently displaying.
         if (priv.core_surface) |core| {
             if (core.renderer.takeFrame()) |frame| {
-                self.rebuildTexture(frame) catch |err| {
-                    log.warn("error building texture from frame err={}", .{err});
+                const desired = self.deviceSize();
+                const actual = switch (frame) {
+                    inline else => |value| .{
+                        .width = value.width,
+                        .height = value.height,
+                    },
                 };
+
+                if (actual.width != desired.width or actual.height != desired.height) {
+                    // A resize can overtake a completed renderer frame before
+                    // GTK snapshots it. Presenting that stale frame at the new
+                    // allocation would visibly stretch all terminal content.
+                    // Keep displaying the previous texture at native scale
+                    // until a frame for the current allocation arrives.
+                    frame.deinit();
+                } else {
+                    self.rebuildTexture(frame) catch |err| {
+                        log.warn("error building texture from frame err={}", .{err});
+                    };
+                }
             }
         }
 
@@ -158,9 +189,28 @@ pub const RenderSurface = extern struct {
         const h = widget.getHeight();
         if (w == 0 or h == 0) return;
 
+        // Always draw retained content at its native logical size. During a
+        // resize the allocation changes before the renderer's replacement
+        // frame is ready; using the allocation as the destination rectangle
+        // scales the old terminal image and makes the contents look stretchy.
+        // Clip explicitly because the native-size texture can be larger than
+        // the widget while the window is shrinking.
+        snap.pushClip(&.{
+            .f_origin = .{ .f_x = 0, .f_y = 0 },
+            .f_size = .{
+                .f_width = @floatFromInt(w),
+                .f_height = @floatFromInt(h),
+            },
+        });
+        defer snap.pop();
+
+        const scale: f32 = @floatFromInt(@max(widget.getScaleFactor(), 1));
         snap.appendTexture(texture, &.{
             .f_origin = .{ .f_x = 0, .f_y = 0 },
-            .f_size = .{ .f_width = @floatFromInt(w), .f_height = @floatFromInt(h) },
+            .f_size = .{
+                .f_width = @as(f32, @floatFromInt(texture.getWidth())) / scale,
+                .f_height = @as(f32, @floatFromInt(texture.getHeight())) / scale,
+            },
         });
     }
 
@@ -329,6 +379,7 @@ pub const RenderSurface = extern struct {
 
         fn init(class: *Class) callconv(.c) void {
             // Virtual methods
+            gobject.Object.virtual_methods.dispose.implement(class, &dispose);
             gtk.Widget.virtual_methods.realize.implement(class, &realize);
             gtk.Widget.virtual_methods.unrealize.implement(class, &unrealize);
             gtk.Widget.virtual_methods.size_allocate.implement(class, &sizeAllocate);
