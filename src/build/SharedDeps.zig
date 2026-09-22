@@ -58,6 +58,11 @@ uucode_tables: std.Build.LazyPath,
 /// singleton or per-target dep.
 uucode_mod: *std.Build.Module,
 
+/// Generated vulkan-zig bindings. This is a singleton for the same reason as
+/// `uucode_mod`: `add` is called for multiple compile steps and Zig requires a
+/// source file to belong to only one module in each compile graph.
+vulkan_mod: ?*std.Build.Module,
+
 /// Used to keep track of a list of file sources.
 pub const LazyPathList = std.ArrayList(std.Build.LazyPath);
 
@@ -77,6 +82,15 @@ pub fn init(b: *std.Build, cfg: *const Config) !SharedDeps {
         .build_config_path = b.path("src/build/uucode_config.zig"),
     }).module("uucode");
 
+    const vulkan_mod = if (cfg.renderer == .vulkan) blk: {
+        const headers = b.lazyDependency("vulkan_headers", .{}) orelse
+            break :blk null;
+        const vulkan = b.lazyDependency("vulkan_zig", .{
+            .registry = headers.path("registry/vk.xml"),
+        }) orelse break :blk null;
+        break :blk vulkan.module("vulkan-zig");
+    } else null;
+
     // Re-export the uucode module so that Zig programs that embed libgtostty-vt
     // can use it. This is necessary to use libraries like libvaxis in
     // the embedding program that need uucode as well (libvaxis provides
@@ -90,6 +104,7 @@ pub fn init(b: *std.Build, cfg: *const Config) !SharedDeps {
         .framedata = try .init(b),
         .uucode_tables = uucode_tables,
         .uucode_mod = uucode_mod,
+        .vulkan_mod = vulkan_mod,
 
         // Setup by retarget
         .options = undefined,
@@ -512,6 +527,7 @@ pub fn add(
         step.root_module.addImport("opengl", dep.module("opengl"));
     }
     if (self.config.renderer == .vulkan) {
+        if (self.vulkan_mod) |mod| step.root_module.addImport("vulkan", mod);
         step.root_module.linkSystemLibrary("vulkan", dynamic_link_opts);
     }
     if (b.lazyDependency("vaxis", .{

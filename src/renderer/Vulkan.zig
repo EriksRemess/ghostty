@@ -1,10 +1,14 @@
 //! Vulkan graphics API backend for the GTK renderer.
+//!
+//! Rendering is offscreen. Each completed target is exported as a dma-buf
+//! for zero-copy GTK presentation when the device supports the required
+//! extensions, with a tightly packed RGBA8 CPU buffer as the fallback.
 pub const Vulkan = @This();
 
 const std = @import("std");
 const builtin = @import("builtin");
 const Allocator = std.mem.Allocator;
-const c = @import("vulkan/api.zig").c;
+const vk = @import("vulkan/api.zig").vk;
 
 const configpkg = @import("../config.zig");
 const font = @import("../font/main.zig");
@@ -27,7 +31,11 @@ pub const Texture = @import("vulkan/Texture.zig");
 pub const shaders = @import("vulkan/shaders.zig");
 
 pub const custom_shader_target: shadertoy.Target = .glsl;
+// Vulkan's framebuffer coordinate system has +Y pointing down. The negative
+// viewport height in RenderPass keeps Ghostty's existing shaders and geometry
+// in that convention.
 pub const custom_shader_y_is_down = true;
+/// Triple-buffering gives the renderer and GTK room to work independently.
 pub const swap_chain_count = 3;
 
 alloc: Allocator,
@@ -86,6 +94,8 @@ pub fn initTarget(self: *const Vulkan, width: usize, height: usize) !Target {
 
 pub fn present(self: *Vulkan, target: Target) !ExportedFrame {
     if (target.exportDmabuf()) |dmabuf| return .{ .dmabuf = dmabuf } else |err| {
+        // A device may advertise the extensions but still reject the selected
+        // format/modifier. Keep presentation functional in that case.
         std.log.scoped(.vulkan).warn("DMA-BUF presentation failed, using memory fallback err={}", .{err});
     }
     return .{ .memory = .{
@@ -98,6 +108,7 @@ pub fn present(self: *Vulkan, target: Target) !ExportedFrame {
 
 pub const ExportedFrame = union(enum) {
     dmabuf: Dmabuf,
+    /// Premultiplied, tightly packed RGBA8 pixels owned by this frame.
     memory: Memory,
 
     pub const Memory = struct {
@@ -122,9 +133,11 @@ pub const ExportedFrame = union(enum) {
 pub inline fn bufferOptions(self: Vulkan) bufferpkg.Options {
     return .{
         .context = self.context,
-        .usage = c.VK_BUFFER_USAGE_VERTEX_BUFFER_BIT |
-            c.VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT |
-            c.VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+        .usage = .{
+            .vertex_buffer_bit = true,
+            .uniform_buffer_bit = true,
+            .storage_buffer_bit = true,
+        },
     };
 }
 
@@ -140,18 +153,18 @@ pub inline fn textureOptions(self: Vulkan) Texture.Options {
         .context = self.context,
         .format = self.targetFormat(),
         .upload_format = .rgba,
-        .min_filter = c.VK_FILTER_LINEAR,
-        .mag_filter = c.VK_FILTER_LINEAR,
-        .address_mode = c.VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE,
+        .min_filter = .linear,
+        .mag_filter = .linear,
+        .address_mode = .clamp_to_edge,
     };
 }
 
 pub inline fn samplerOptions(self: Vulkan) Sampler.Options {
     return .{
         .context = self.context,
-        .min_filter = c.VK_FILTER_LINEAR,
-        .mag_filter = c.VK_FILTER_LINEAR,
-        .address_mode = c.VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE,
+        .min_filter = .linear,
+        .mag_filter = .linear,
+        .address_mode = .clamp_to_edge,
     };
 }
 
@@ -161,34 +174,34 @@ pub inline fn imageTextureOptions(self: Vulkan, format: ImageTextureFormat, srgb
     return .{
         .context = self.context,
         .format = switch (format) {
-            .gray => c.VK_FORMAT_R8_UNORM,
-            .rgba => if (srgb) c.VK_FORMAT_R8G8B8A8_SRGB else c.VK_FORMAT_R8G8B8A8_UNORM,
-            .bgra => if (srgb) c.VK_FORMAT_B8G8R8A8_SRGB else c.VK_FORMAT_B8G8R8A8_UNORM,
+            .gray => .r8_unorm,
+            .rgba => if (srgb) .r8g8b8a8_srgb else .r8g8b8a8_unorm,
+            .bgra => if (srgb) .b8g8r8a8_srgb else .b8g8r8a8_unorm,
         },
         .upload_format = switch (format) {
             .gray => .gray,
             .rgba => .rgba,
             .bgra => .bgra,
         },
-        .min_filter = c.VK_FILTER_LINEAR,
-        .mag_filter = c.VK_FILTER_LINEAR,
-        .address_mode = c.VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE,
+        .min_filter = .linear,
+        .mag_filter = .linear,
+        .address_mode = .clamp_to_edge,
     };
 }
 
 pub fn initAtlasTexture(self: *const Vulkan, atlas: *const font.Atlas) Texture.Error!Texture {
-    const format: c.VkFormat, const upload_format: Texture.PixelFormat = switch (atlas.format) {
-        .grayscale => .{ c.VK_FORMAT_R8_UNORM, .gray },
-        .bgra => .{ c.VK_FORMAT_B8G8R8A8_SRGB, .bgra },
+    const format: vk.Format, const upload_format: Texture.PixelFormat = switch (atlas.format) {
+        .grayscale => .{ .r8_unorm, .gray },
+        .bgra => .{ .b8g8r8a8_srgb, .bgra },
         else => @panic("unsupported atlas format for Vulkan texture"),
     };
     return .init(.{
         .context = self.context,
         .format = format,
         .upload_format = upload_format,
-        .min_filter = c.VK_FILTER_NEAREST,
-        .mag_filter = c.VK_FILTER_NEAREST,
-        .address_mode = c.VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE,
+        .min_filter = .nearest,
+        .mag_filter = .nearest,
+        .address_mode = .clamp_to_edge,
         .unnormalized_coordinates = true,
     }, atlas.size, atlas.size, null);
 }
@@ -198,6 +211,6 @@ pub inline fn beginFrame(self: *const Vulkan, renderer: *Renderer, target: *Targ
     return .begin(.{}, renderer, target);
 }
 
-fn targetFormat(self: *const Vulkan) c.VkFormat {
-    return if (self.blending.isLinear()) c.VK_FORMAT_R8G8B8A8_SRGB else c.VK_FORMAT_R8G8B8A8_UNORM;
+fn targetFormat(self: *const Vulkan) vk.Format {
+    return if (self.blending.isLinear()) .r8g8b8a8_srgb else .r8g8b8a8_unorm;
 }

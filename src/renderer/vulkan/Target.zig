@@ -1,7 +1,14 @@
+//! Represents an offscreen Vulkan render target.
+//!
+//! texture is the color attachment. Every completed frame is copied to the
+//! host-visible readback buffer so CPU presentation is always available. If
+//! external-memory support is usable, the same frame is also copied to
+//! export_image, whose memory is exported to GTK as a dma-buf.
+
 const Self = @This();
 
 const std = @import("std");
-const c = @import("api.zig").c;
+const vk = @import("api.zig").vk;
 const Context = @import("Context.zig");
 const Texture = @import("Texture.zig");
 const bufferpkg = @import("buffer.zig");
@@ -18,7 +25,7 @@ pub const Options = struct {
     context: *Context,
     width: usize,
     height: usize,
-    format: c.VkFormat,
+    format: vk.Format,
 };
 
 context: *Context,
@@ -33,20 +40,22 @@ pub fn init(opts: Options) !Self {
         .context = opts.context,
         .format = opts.format,
         .upload_format = .rgba,
-        .min_filter = c.VK_FILTER_LINEAR,
-        .mag_filter = c.VK_FILTER_LINEAR,
-        .address_mode = c.VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE,
+        .min_filter = .linear,
+        .mag_filter = .linear,
+        .address_mode = .clamp_to_edge,
     }, opts.width, opts.height, null);
     errdefer texture.deinit();
 
     const readback = try bufferpkg.Handle.init(.{
         .context = opts.context,
-        .usage = c.VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+        .usage = .{ .transfer_dst_bit = true },
     }, opts.width * opts.height * 4);
     errdefer readback.deinit();
 
     const export_image: ?ExportImage = if (opts.context.supports_dmabuf)
         ExportImage.init(opts.context, opts.width, opts.height, opts.format) catch |err| fallback: {
+            // Modifier support can differ by format even when all required
+            // extensions exist. Retain the guaranteed CPU fallback.
             log.warn("DMA-BUF export image unavailable, using memory presentation err={}", .{err});
             break :fallback null;
         }
@@ -70,103 +79,119 @@ pub fn deinit(self: *Self) void {
     self.texture.deinit();
 }
 
-pub fn recordReadback(self: *const Self, command_buffer: c.VkCommandBuffer) void {
+pub fn recordReadback(self: *const Self, command_buffer: vk.CommandBuffer) void {
+    // Both presentation paths consume the rendered attachment, so establish
+    // transfer visibility before recording either copy.
     Texture.imageBarrier(
+        self.context,
         command_buffer,
         self.texture.image,
-        c.VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
-        c.VK_ACCESS_TRANSFER_READ_BIT,
-        c.VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
-        c.VK_PIPELINE_STAGE_TRANSFER_BIT,
-        c.VK_IMAGE_LAYOUT_GENERAL,
-        c.VK_IMAGE_LAYOUT_GENERAL,
+        .{ .color_attachment_write_bit = true },
+        .{ .transfer_read_bit = true },
+        .{ .color_attachment_output_bit = true },
+        .{ .transfer_bit = true },
+        .general,
+        .general,
     );
 
-    var region = std.mem.zeroes(c.VkBufferImageCopy);
-    region.imageSubresource = .{
-        .aspectMask = c.VK_IMAGE_ASPECT_COLOR_BIT,
-        .mipLevel = 0,
-        .baseArrayLayer = 0,
-        .layerCount = 1,
-    };
-    region.imageExtent = .{
-        .width = @intCast(self.width),
-        .height = @intCast(self.height),
-        .depth = 1,
-    };
-    c.vkCmdCopyImageToBuffer(
-        command_buffer,
-        self.texture.image,
-        c.VK_IMAGE_LAYOUT_GENERAL,
-        self.readback.buffer,
-        1,
-        &region,
-    );
-
-    if (self.export_image) |export_image| {
-        Texture.imageBarrier(
-            command_buffer,
-            export_image.image,
-            c.VK_ACCESS_MEMORY_READ_BIT,
-            c.VK_ACCESS_TRANSFER_WRITE_BIT,
-            c.VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
-            c.VK_PIPELINE_STAGE_TRANSFER_BIT,
-            c.VK_IMAGE_LAYOUT_GENERAL,
-            c.VK_IMAGE_LAYOUT_GENERAL,
-        );
-        var image_copy = std.mem.zeroes(c.VkImageCopy);
-        image_copy.srcSubresource = .{
-            .aspectMask = c.VK_IMAGE_ASPECT_COLOR_BIT,
-            .mipLevel = 0,
-            .baseArrayLayer = 0,
-            .layerCount = 1,
-        };
-        image_copy.dstSubresource = image_copy.srcSubresource;
-        image_copy.extent = .{
+    const region: vk.BufferImageCopy = .{
+        .buffer_offset = 0,
+        .buffer_row_length = 0,
+        .buffer_image_height = 0,
+        .image_subresource = .{
+            .aspect_mask = .{ .color_bit = true },
+            .mip_level = 0,
+            .base_array_layer = 0,
+            .layer_count = 1,
+        },
+        .image_offset = .{ .x = 0, .y = 0, .z = 0 },
+        .image_extent = .{
             .width = @intCast(self.width),
             .height = @intCast(self.height),
             .depth = 1,
+        },
+    };
+    self.context.device.cmdCopyImageToBuffer(
+        command_buffer,
+        self.texture.image,
+        .general,
+        self.readback.buffer,
+        @ptrCast(&region),
+    );
+
+    if (self.export_image) |export_image| {
+        // The export image is deliberately separate: dma-buf-capable tiling
+        // and memory requirements need not match the optimal render target.
+        Texture.imageBarrier(
+            self.context,
+            command_buffer,
+            export_image.image,
+            .{ .memory_read_bit = true },
+            .{ .transfer_write_bit = true },
+            .{ .all_commands_bit = true },
+            .{ .transfer_bit = true },
+            .general,
+            .general,
+        );
+        const image_copy: vk.ImageCopy = .{
+            .src_subresource = .{
+                .aspect_mask = .{ .color_bit = true },
+                .mip_level = 0,
+                .base_array_layer = 0,
+                .layer_count = 1,
+            },
+            .src_offset = .{ .x = 0, .y = 0, .z = 0 },
+            .dst_subresource = .{
+                .aspect_mask = .{ .color_bit = true },
+                .mip_level = 0,
+                .base_array_layer = 0,
+                .layer_count = 1,
+            },
+            .dst_offset = .{ .x = 0, .y = 0, .z = 0 },
+            .extent = .{
+                .width = @intCast(self.width),
+                .height = @intCast(self.height),
+                .depth = 1,
+            },
         };
-        c.vkCmdCopyImage(
+        self.context.device.cmdCopyImage(
             command_buffer,
             self.texture.image,
-            c.VK_IMAGE_LAYOUT_GENERAL,
+            .general,
             export_image.image,
-            c.VK_IMAGE_LAYOUT_GENERAL,
-            1,
-            &image_copy,
+            .general,
+            @ptrCast(&image_copy),
         );
         Texture.imageBarrier(
+            self.context,
             command_buffer,
             export_image.image,
-            c.VK_ACCESS_TRANSFER_WRITE_BIT,
-            c.VK_ACCESS_MEMORY_READ_BIT,
-            c.VK_PIPELINE_STAGE_TRANSFER_BIT,
-            c.VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
-            c.VK_IMAGE_LAYOUT_GENERAL,
-            c.VK_IMAGE_LAYOUT_GENERAL,
+            .{ .transfer_write_bit = true },
+            .{ .memory_read_bit = true },
+            .{ .transfer_bit = true },
+            .{ .bottom_of_pipe_bit = true },
+            .general,
+            .general,
         );
     }
 
-    var barrier = std.mem.zeroes(c.VkBufferMemoryBarrier);
-    barrier.sType = c.VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
-    barrier.srcAccessMask = c.VK_ACCESS_TRANSFER_WRITE_BIT;
-    barrier.dstAccessMask = c.VK_ACCESS_HOST_READ_BIT;
-    barrier.srcQueueFamilyIndex = c.VK_QUEUE_FAMILY_IGNORED;
-    barrier.dstQueueFamilyIndex = c.VK_QUEUE_FAMILY_IGNORED;
-    barrier.buffer = self.readback.buffer;
-    barrier.offset = 0;
-    barrier.size = c.VK_WHOLE_SIZE;
-    c.vkCmdPipelineBarrier(
+    // Make the transfer visible to mapMemory after the submission fence.
+    const barrier: vk.BufferMemoryBarrier = .{
+        .src_access_mask = .{ .transfer_write_bit = true },
+        .dst_access_mask = .{ .host_read_bit = true },
+        .src_queue_family_index = vk.QUEUE_FAMILY_IGNORED,
+        .dst_queue_family_index = vk.QUEUE_FAMILY_IGNORED,
+        .buffer = self.readback.buffer,
+        .offset = 0,
+        .size = vk.WHOLE_SIZE,
+    };
+    self.context.device.cmdPipelineBarrier(
         command_buffer,
-        c.VK_PIPELINE_STAGE_TRANSFER_BIT,
-        c.VK_PIPELINE_STAGE_HOST_BIT,
-        0,
-        0,
+        .{ .transfer_bit = true },
+        .{ .host_bit = true },
+        .{},
         null,
-        1,
-        &barrier,
-        0,
+        @ptrCast(&barrier),
         null,
     );
 }
@@ -176,16 +201,8 @@ pub fn readPixelsAlloc(self: *const Self, alloc: std.mem.Allocator) ![]u8 {
     const pixels = try alloc.alloc(u8, size);
     errdefer alloc.free(pixels);
 
-    var mapped: ?*anyopaque = null;
-    try Context.result(c.vkMapMemory(
-        self.context.device,
-        self.readback.memory,
-        0,
-        size,
-        0,
-        &mapped,
-    ));
-    defer c.vkUnmapMemory(self.context.device, self.readback.memory);
+    const mapped = try self.context.device.mapMemory(self.readback.memory, 0, size, .{});
+    defer self.context.device.unmapMemory(self.readback.memory);
     const src: [*]const u8 = @ptrCast(mapped.?);
     @memcpy(pixels, src[0..size]);
     return pixels;
@@ -193,13 +210,10 @@ pub fn readPixelsAlloc(self: *const Self, alloc: std.mem.Allocator) ![]u8 {
 
 pub fn exportDmabuf(self: *const Self) !Dmabuf {
     const export_image = self.export_image orelse return error.DmabufUnsupported;
-
-    var fd_info = std.mem.zeroes(c.VkMemoryGetFdInfoKHR);
-    fd_info.sType = c.VK_STRUCTURE_TYPE_MEMORY_GET_FD_INFO_KHR;
-    fd_info.memory = export_image.memory;
-    fd_info.handleType = c.VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT;
-    var fd: c_int = -1;
-    try Context.result(self.context.get_memory_fd.?(self.context.device, &fd_info, &fd));
+    const fd = try self.context.device.getMemoryFdKHR(&.{
+        .memory = export_image.memory,
+        .handle_type = .{ .dma_buf_bit_ext = true },
+    });
     errdefer {
         if (fd >= 0) _ = std.posix.system.close(fd);
     }
@@ -207,7 +221,7 @@ pub fn exportDmabuf(self: *const Self) !Dmabuf {
     var planes: Dmabuf.Planes = .{ .count = 1 };
     planes.fds[0] = fd;
     planes.offsets[0] = @intCast(export_image.layout.offset);
-    planes.strides[0] = @intCast(export_image.layout.rowPitch);
+    planes.strides[0] = @intCast(export_image.layout.row_pitch);
     try planes.validate();
 
     return .{
@@ -222,85 +236,77 @@ pub fn exportDmabuf(self: *const Self) !Dmabuf {
 
 const ExportImage = struct {
     context: *Context,
-    image: c.VkImage,
-    memory: c.VkDeviceMemory,
+    image: vk.Image,
+    memory: vk.DeviceMemory,
     modifier: u64,
-    layout: c.VkSubresourceLayout,
+    layout: vk.SubresourceLayout,
 
-    fn init(context: *Context, width: usize, height: usize, format: c.VkFormat) !ExportImage {
+    fn init(context: *Context, width: usize, height: usize, format: vk.Format) !ExportImage {
         const modifier = try chooseModifier(context, format);
 
-        var modifier_info = std.mem.zeroes(c.VkImageDrmFormatModifierListCreateInfoEXT);
-        modifier_info.sType = c.VK_STRUCTURE_TYPE_IMAGE_DRM_FORMAT_MODIFIER_LIST_CREATE_INFO_EXT;
-        modifier_info.drmFormatModifierCount = 1;
-        modifier_info.pDrmFormatModifiers = &modifier;
-
-        var external_info = std.mem.zeroes(c.VkExternalMemoryImageCreateInfo);
-        external_info.sType = c.VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_IMAGE_CREATE_INFO;
-        external_info.pNext = &modifier_info;
-        external_info.handleTypes = c.VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT;
-
-        var image_info = std.mem.zeroes(c.VkImageCreateInfo);
-        image_info.sType = c.VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
-        image_info.pNext = &external_info;
-        image_info.imageType = c.VK_IMAGE_TYPE_2D;
-        image_info.format = format;
-        image_info.extent = .{ .width = @intCast(width), .height = @intCast(height), .depth = 1 };
-        image_info.mipLevels = 1;
-        image_info.arrayLayers = 1;
-        image_info.samples = c.VK_SAMPLE_COUNT_1_BIT;
-        image_info.tiling = c.VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT;
-        image_info.usage = c.VK_IMAGE_USAGE_TRANSFER_DST_BIT;
-        image_info.sharingMode = c.VK_SHARING_MODE_EXCLUSIVE;
-        image_info.initialLayout = c.VK_IMAGE_LAYOUT_UNDEFINED;
-
-        var image: c.VkImage = null;
-        try Context.result(c.vkCreateImage(context.device, &image_info, null, &image));
-        errdefer c.vkDestroyImage(context.device, image, null);
-
-        var requirements = std.mem.zeroes(c.VkMemoryRequirements);
-        c.vkGetImageMemoryRequirements(context.device, image, &requirements);
-
-        var dedicated = std.mem.zeroes(c.VkMemoryDedicatedAllocateInfo);
-        dedicated.sType = c.VK_STRUCTURE_TYPE_MEMORY_DEDICATED_ALLOCATE_INFO;
-        dedicated.image = image;
-        var export_info = std.mem.zeroes(c.VkExportMemoryAllocateInfo);
-        export_info.sType = c.VK_STRUCTURE_TYPE_EXPORT_MEMORY_ALLOCATE_INFO;
-        export_info.pNext = &dedicated;
-        export_info.handleTypes = c.VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT;
-        var alloc_info = std.mem.zeroes(c.VkMemoryAllocateInfo);
-        alloc_info.sType = c.VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
-        alloc_info.pNext = &export_info;
-        alloc_info.allocationSize = requirements.size;
-        alloc_info.memoryTypeIndex = try context.memoryType(requirements.memoryTypeBits, c.VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
-
-        var memory: c.VkDeviceMemory = null;
-        try Context.result(c.vkAllocateMemory(context.device, &alloc_info, null, &memory));
-        errdefer c.vkFreeMemory(context.device, memory, null);
-        try Context.result(c.vkBindImageMemory(context.device, image, memory, 0));
-
-        var modifier_props = std.mem.zeroes(c.VkImageDrmFormatModifierPropertiesEXT);
-        modifier_props.sType = c.VK_STRUCTURE_TYPE_IMAGE_DRM_FORMAT_MODIFIER_PROPERTIES_EXT;
-        try Context.result(context.get_image_drm_format_modifier_properties.?(context.device, image, &modifier_props));
-
-        const subresource = c.VkImageSubresource{
-            .aspectMask = c.VK_IMAGE_ASPECT_COLOR_BIT,
-            .mipLevel = 0,
-            .arrayLayer = 0,
+        var modifier_info: vk.ImageDrmFormatModifierListCreateInfoEXT = .{
+            .drm_format_modifier_count = 1,
+            .p_drm_format_modifiers = @ptrCast(&modifier),
         };
-        var layout = std.mem.zeroes(c.VkSubresourceLayout);
-        c.vkGetImageSubresourceLayout(context.device, image, &subresource, &layout);
+        var external_info: vk.ExternalMemoryImageCreateInfo = .{
+            .p_next = &modifier_info,
+            .handle_types = .{ .dma_buf_bit_ext = true },
+        };
+        const image = try context.device.createImage(&.{
+            .p_next = &external_info,
+            .image_type = .@"2d",
+            .format = format,
+            .extent = .{ .width = @intCast(width), .height = @intCast(height), .depth = 1 },
+            .mip_levels = 1,
+            .array_layers = 1,
+            .samples = .{ .@"1_bit" = true },
+            .tiling = .drm_format_modifier_ext,
+            .usage = .{ .transfer_dst_bit = true },
+            .sharing_mode = .exclusive,
+            .initial_layout = .undefined,
+        }, null);
+        errdefer context.device.destroyImage(image, null);
+
+        const requirements = context.device.getImageMemoryRequirements(image);
+        var dedicated: vk.MemoryDedicatedAllocateInfo = .{ .image = image };
+        var export_info: vk.ExportMemoryAllocateInfo = .{
+            .p_next = &dedicated,
+            .handle_types = .{ .dma_buf_bit_ext = true },
+        };
+        const memory = try context.device.allocateMemory(&.{
+            .p_next = &export_info,
+            .allocation_size = requirements.size,
+            .memory_type_index = try context.memoryType(
+                requirements.memory_type_bits,
+                .{ .device_local_bit = true },
+            ),
+        }, null);
+        errdefer context.device.freeMemory(memory, null);
+        try context.device.bindImageMemory(image, memory, 0);
+
+        var modifier_props: vk.ImageDrmFormatModifierPropertiesEXT = .{
+            .drm_format_modifier = 0,
+        };
+        try context.device.getImageDrmFormatModifierPropertiesEXT(image, &modifier_props);
+
+        const subresource: vk.ImageSubresource = .{
+            .aspect_mask = .{ .color_bit = true },
+            .mip_level = 0,
+            .array_layer = 0,
+        };
+        const layout = context.device.getImageSubresourceLayout(image, &subresource);
 
         const command_buffer = try context.beginCommands();
         Texture.imageBarrier(
+            context,
             command_buffer,
             image,
-            0,
-            c.VK_ACCESS_TRANSFER_WRITE_BIT,
-            c.VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
-            c.VK_PIPELINE_STAGE_TRANSFER_BIT,
-            c.VK_IMAGE_LAYOUT_UNDEFINED,
-            c.VK_IMAGE_LAYOUT_GENERAL,
+            .{},
+            .{ .transfer_write_bit = true },
+            .{ .top_of_pipe_bit = true },
+            .{ .transfer_bit = true },
+            .undefined,
+            .general,
         );
         try context.submitCommands(command_buffer);
 
@@ -308,36 +314,38 @@ const ExportImage = struct {
             .context = context,
             .image = image,
             .memory = memory,
-            .modifier = modifier_props.drmFormatModifier,
+            .modifier = modifier_props.drm_format_modifier,
             .layout = layout,
         };
     }
 
     fn deinit(self: ExportImage) void {
-        c.vkDestroyImage(self.context.device, self.image, null);
-        c.vkFreeMemory(self.context.device, self.memory, null);
+        self.context.device.destroyImage(self.image, null);
+        self.context.device.freeMemory(self.memory, null);
     }
 
-    fn chooseModifier(context: *Context, format: c.VkFormat) !u64 {
-        var list = std.mem.zeroes(c.VkDrmFormatModifierPropertiesListEXT);
-        list.sType = c.VK_STRUCTURE_TYPE_DRM_FORMAT_MODIFIER_PROPERTIES_LIST_EXT;
-        var props = std.mem.zeroes(c.VkFormatProperties2);
-        props.sType = c.VK_STRUCTURE_TYPE_FORMAT_PROPERTIES_2;
-        props.pNext = &list;
-        c.vkGetPhysicalDeviceFormatProperties2(context.physical_device, format, &props);
-        if (list.drmFormatModifierCount == 0) return error.NoDrmModifier;
+    fn chooseModifier(context: *Context, format: vk.Format) !u64 {
+        // Prefer linear because GTK import support is broadest there, but use
+        // any modifier that supports transfer destinations when unavailable.
+        var list: vk.DrmFormatModifierPropertiesListEXT = .{};
+        var props: vk.FormatProperties2 = .{
+            .p_next = &list,
+            .format_properties = undefined,
+        };
+        context.instance.getPhysicalDeviceFormatProperties2(context.physical_device, format, &props);
+        if (list.drm_format_modifier_count == 0) return error.NoDrmModifier;
 
         const alloc = std.heap.c_allocator;
-        const modifiers = try alloc.alloc(c.VkDrmFormatModifierPropertiesEXT, list.drmFormatModifierCount);
+        const modifiers = try alloc.alloc(vk.DrmFormatModifierPropertiesEXT, list.drm_format_modifier_count);
         defer alloc.free(modifiers);
-        list.pDrmFormatModifierProperties = modifiers.ptr;
-        c.vkGetPhysicalDeviceFormatProperties2(context.physical_device, format, &props);
+        list.p_drm_format_modifier_properties = modifiers.ptr;
+        context.instance.getPhysicalDeviceFormatProperties2(context.physical_device, format, &props);
 
         var fallback: ?u64 = null;
         for (modifiers) |value| {
-            if ((value.drmFormatModifierTilingFeatures & c.VK_FORMAT_FEATURE_TRANSFER_DST_BIT) == 0) continue;
-            if (fallback == null) fallback = value.drmFormatModifier;
-            if (value.drmFormatModifier == drm_format_mod_linear) return value.drmFormatModifier;
+            if (!value.drm_format_modifier_tiling_features.transfer_dst_bit) continue;
+            if (fallback == null) fallback = value.drm_format_modifier;
+            if (value.drm_format_modifier == drm_format_mod_linear) return value.drm_format_modifier;
         }
         return fallback orelse error.NoTransferDrmModifier;
     }

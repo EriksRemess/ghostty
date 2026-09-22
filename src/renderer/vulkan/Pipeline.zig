@@ -1,7 +1,7 @@
 const Self = @This();
 
 const std = @import("std");
-const c = @import("api.zig").c;
+const vk = @import("api.zig").vk;
 const Context = @import("Context.zig");
 const shader_compile = @import("shader_compile.zig");
 
@@ -10,30 +10,30 @@ pub const Options = struct {
     vertex_fn: [:0]const u8,
     fragment_fn: [:0]const u8,
     step_fn: StepFunction = .per_vertex,
-    topology: c.VkPrimitiveTopology = c.VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST,
+    topology: vk.PrimitiveTopology = .triangle_list,
     blending_enabled: bool = true,
-    format: c.VkFormat,
+    format: vk.Format,
 
     pub const StepFunction = enum { constant, per_vertex, per_instance };
 };
 
 context: *Context,
-pipeline: c.VkPipeline,
+pipeline: vk.Pipeline,
 stride: usize,
 
 pub fn init(comptime VertexAttributes: ?type, opts: Options) !Self {
     const alloc = std.heap.c_allocator;
     const vertex = try shader_compile.module(opts.context, alloc, opts.vertex_fn, .vertex);
-    defer c.vkDestroyShaderModule(opts.context.device, vertex, null);
+    defer opts.context.device.destroyShaderModule(vertex, null);
     const fragment = try shader_compile.module(opts.context, alloc, opts.fragment_fn, .fragment);
-    defer c.vkDestroyShaderModule(opts.context.device, fragment, null);
+    defer opts.context.device.destroyShaderModule(fragment, null);
 
-    const stages = [_]c.VkPipelineShaderStageCreateInfo{
-        shaderStage(c.VK_SHADER_STAGE_VERTEX_BIT, vertex),
-        shaderStage(c.VK_SHADER_STAGE_FRAGMENT_BIT, fragment),
+    const stages = [_]vk.PipelineShaderStageCreateInfo{
+        shaderStage(.{ .vertex_bit = true }, vertex),
+        shaderStage(.{ .fragment_bit = true }, fragment),
     };
 
-    var attribute_storage: [16]c.VkVertexInputAttributeDescription = undefined;
+    var attribute_storage: [16]vk.VertexInputAttributeDescription = undefined;
     const attribute_count: u32 = if (VertexAttributes) |T| count: {
         inline for (@typeInfo(T).@"struct".fields, 0..) |field, i| {
             attribute_storage[i] = .{
@@ -46,88 +46,107 @@ pub fn init(comptime VertexAttributes: ?type, opts: Options) !Self {
         break :count @typeInfo(T).@"struct".fields.len;
     } else 0;
 
-    var binding = std.mem.zeroes(c.VkVertexInputBindingDescription);
+    var binding: vk.VertexInputBindingDescription = undefined;
     if (VertexAttributes) |T| {
         binding.binding = 0;
         binding.stride = @sizeOf(T);
-        binding.inputRate = switch (opts.step_fn) {
-            .per_instance, .constant => c.VK_VERTEX_INPUT_RATE_INSTANCE,
-            .per_vertex => c.VK_VERTEX_INPUT_RATE_VERTEX,
+        binding.input_rate = switch (opts.step_fn) {
+            .per_instance, .constant => .instance,
+            .per_vertex => .vertex,
         };
     }
 
-    var vertex_input = std.mem.zeroes(c.VkPipelineVertexInputStateCreateInfo);
-    vertex_input.sType = c.VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO;
-    vertex_input.vertexBindingDescriptionCount = if (VertexAttributes == null) 0 else 1;
-    vertex_input.pVertexBindingDescriptions = if (VertexAttributes == null) null else &binding;
-    vertex_input.vertexAttributeDescriptionCount = attribute_count;
-    vertex_input.pVertexAttributeDescriptions = if (attribute_count == 0) null else &attribute_storage;
+    const vertex_input: vk.PipelineVertexInputStateCreateInfo = .{
+        .vertex_binding_description_count = if (VertexAttributes == null) 0 else 1,
+        .p_vertex_binding_descriptions = if (VertexAttributes == null) null else @ptrCast(&binding),
+        .vertex_attribute_description_count = attribute_count,
+        .p_vertex_attribute_descriptions = if (attribute_count == 0) null else &attribute_storage,
+    };
+    const input_assembly: vk.PipelineInputAssemblyStateCreateInfo = .{
+        .topology = opts.topology,
+        .primitive_restart_enable = .false,
+    };
+    const viewport_state: vk.PipelineViewportStateCreateInfo = .{
+        .viewport_count = 1,
+        .scissor_count = 1,
+    };
+    const rasterization: vk.PipelineRasterizationStateCreateInfo = .{
+        .depth_clamp_enable = .false,
+        .rasterizer_discard_enable = .false,
+        .polygon_mode = .fill,
+        .front_face = .counter_clockwise,
+        .depth_bias_enable = .false,
+        .depth_bias_constant_factor = 0,
+        .depth_bias_clamp = 0,
+        .depth_bias_slope_factor = 0,
+        .line_width = 1,
+    };
+    const multisample: vk.PipelineMultisampleStateCreateInfo = .{
+        .rasterization_samples = .{ .@"1_bit" = true },
+        .sample_shading_enable = .false,
+        .min_sample_shading = 0,
+        .alpha_to_coverage_enable = .false,
+        .alpha_to_one_enable = .false,
+    };
+    const blend_attachment: vk.PipelineColorBlendAttachmentState = .{
+        .blend_enable = if (opts.blending_enabled) .true else .false,
+        .src_color_blend_factor = .one,
+        .dst_color_blend_factor = .one_minus_src_alpha,
+        .color_blend_op = .add,
+        .src_alpha_blend_factor = .one,
+        .dst_alpha_blend_factor = .one_minus_src_alpha,
+        .alpha_blend_op = .add,
+        .color_write_mask = .{
+            .r_bit = true,
+            .g_bit = true,
+            .b_bit = true,
+            .a_bit = true,
+        },
+    };
+    const color_blend: vk.PipelineColorBlendStateCreateInfo = .{
+        .logic_op_enable = .false,
+        .logic_op = .clear,
+        .attachment_count = 1,
+        .p_attachments = @ptrCast(&blend_attachment),
+        .blend_constants = .{ 0, 0, 0, 0 },
+    };
+    const dynamic_states = [_]vk.DynamicState{ .viewport, .scissor };
+    const dynamic: vk.PipelineDynamicStateCreateInfo = .{
+        .dynamic_state_count = dynamic_states.len,
+        .p_dynamic_states = &dynamic_states,
+    };
+    // Ghostty has one color attachment and uses Vulkan 1.3 dynamic rendering,
+    // so pipelines do not need render-pass objects or framebuffers.
+    const rendering: vk.PipelineRenderingCreateInfo = .{
+        .view_mask = 0,
+        .color_attachment_count = 1,
+        .p_color_attachment_formats = @ptrCast(&opts.format),
+        .depth_attachment_format = .undefined,
+        .stencil_attachment_format = .undefined,
+    };
+    const info: vk.GraphicsPipelineCreateInfo = .{
+        .p_next = &rendering,
+        .stage_count = stages.len,
+        .p_stages = &stages,
+        .p_vertex_input_state = &vertex_input,
+        .p_input_assembly_state = &input_assembly,
+        .p_viewport_state = &viewport_state,
+        .p_rasterization_state = &rasterization,
+        .p_multisample_state = &multisample,
+        .p_color_blend_state = &color_blend,
+        .p_dynamic_state = &dynamic,
+        .layout = opts.context.pipeline_layout,
+        .subpass = 0,
+        .base_pipeline_index = -1,
+    };
 
-    var input_assembly = std.mem.zeroes(c.VkPipelineInputAssemblyStateCreateInfo);
-    input_assembly.sType = c.VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO;
-    input_assembly.topology = opts.topology;
-
-    var viewport_state = std.mem.zeroes(c.VkPipelineViewportStateCreateInfo);
-    viewport_state.sType = c.VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO;
-    viewport_state.viewportCount = 1;
-    viewport_state.scissorCount = 1;
-
-    var rasterization = std.mem.zeroes(c.VkPipelineRasterizationStateCreateInfo);
-    rasterization.sType = c.VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO;
-    rasterization.polygonMode = c.VK_POLYGON_MODE_FILL;
-    rasterization.cullMode = c.VK_CULL_MODE_NONE;
-    rasterization.frontFace = c.VK_FRONT_FACE_COUNTER_CLOCKWISE;
-    rasterization.lineWidth = 1;
-
-    var multisample = std.mem.zeroes(c.VkPipelineMultisampleStateCreateInfo);
-    multisample.sType = c.VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO;
-    multisample.rasterizationSamples = c.VK_SAMPLE_COUNT_1_BIT;
-
-    var blend_attachment = std.mem.zeroes(c.VkPipelineColorBlendAttachmentState);
-    blend_attachment.blendEnable = if (opts.blending_enabled) c.VK_TRUE else c.VK_FALSE;
-    blend_attachment.srcColorBlendFactor = c.VK_BLEND_FACTOR_ONE;
-    blend_attachment.dstColorBlendFactor = c.VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA;
-    blend_attachment.colorBlendOp = c.VK_BLEND_OP_ADD;
-    blend_attachment.srcAlphaBlendFactor = c.VK_BLEND_FACTOR_ONE;
-    blend_attachment.dstAlphaBlendFactor = c.VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA;
-    blend_attachment.alphaBlendOp = c.VK_BLEND_OP_ADD;
-    blend_attachment.colorWriteMask = c.VK_COLOR_COMPONENT_R_BIT |
-        c.VK_COLOR_COMPONENT_G_BIT |
-        c.VK_COLOR_COMPONENT_B_BIT |
-        c.VK_COLOR_COMPONENT_A_BIT;
-
-    var color_blend = std.mem.zeroes(c.VkPipelineColorBlendStateCreateInfo);
-    color_blend.sType = c.VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO;
-    color_blend.attachmentCount = 1;
-    color_blend.pAttachments = &blend_attachment;
-
-    const dynamic_states = [_]c.VkDynamicState{ c.VK_DYNAMIC_STATE_VIEWPORT, c.VK_DYNAMIC_STATE_SCISSOR };
-    var dynamic = std.mem.zeroes(c.VkPipelineDynamicStateCreateInfo);
-    dynamic.sType = c.VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO;
-    dynamic.dynamicStateCount = dynamic_states.len;
-    dynamic.pDynamicStates = &dynamic_states;
-
-    var rendering = std.mem.zeroes(c.VkPipelineRenderingCreateInfo);
-    rendering.sType = c.VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO;
-    rendering.colorAttachmentCount = 1;
-    rendering.pColorAttachmentFormats = &opts.format;
-
-    var info = std.mem.zeroes(c.VkGraphicsPipelineCreateInfo);
-    info.sType = c.VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO;
-    info.pNext = &rendering;
-    info.stageCount = stages.len;
-    info.pStages = &stages;
-    info.pVertexInputState = &vertex_input;
-    info.pInputAssemblyState = &input_assembly;
-    info.pViewportState = &viewport_state;
-    info.pRasterizationState = &rasterization;
-    info.pMultisampleState = &multisample;
-    info.pColorBlendState = &color_blend;
-    info.pDynamicState = &dynamic;
-    info.layout = opts.context.pipeline_layout;
-
-    var pipeline: c.VkPipeline = null;
-    try Context.result(c.vkCreateGraphicsPipelines(opts.context.device, null, 1, &info, null, &pipeline));
+    var pipeline: vk.Pipeline = undefined;
+    _ = try opts.context.device.createGraphicsPipelines(
+        .null_handle,
+        @ptrCast(&info),
+        null,
+        @ptrCast(&pipeline),
+    );
     return .{
         .context = opts.context,
         .pipeline = pipeline,
@@ -136,19 +155,14 @@ pub fn init(comptime VertexAttributes: ?type, opts: Options) !Self {
 }
 
 pub fn deinit(self: Self) void {
-    c.vkDestroyPipeline(self.context.device, self.pipeline, null);
+    self.context.device.destroyPipeline(self.pipeline, null);
 }
 
-fn shaderStage(stage: c.VkShaderStageFlagBits, module_: c.VkShaderModule) c.VkPipelineShaderStageCreateInfo {
-    var info = std.mem.zeroes(c.VkPipelineShaderStageCreateInfo);
-    info.sType = c.VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
-    info.stage = stage;
-    info.module = module_;
-    info.pName = "main";
-    return info;
+fn shaderStage(stage: vk.ShaderStageFlags, module_: vk.ShaderModule) vk.PipelineShaderStageCreateInfo {
+    return .{ .stage = stage, .module = module_, .p_name = "main" };
 }
 
-fn vertexFormat(comptime T_: type) c.VkFormat {
+fn vertexFormat(comptime T_: type) vk.Format {
     const T = switch (@typeInfo(T_)) {
         .@"struct" => |s| s.backing_integer.?,
         .@"enum" => |e| e.tag_type,
@@ -160,45 +174,45 @@ fn vertexFormat(comptime T_: type) c.VkFormat {
     };
     return switch (Child) {
         u8 => switch (len) {
-            1 => c.VK_FORMAT_R8_UINT,
-            2 => c.VK_FORMAT_R8G8_UINT,
-            4 => c.VK_FORMAT_R8G8B8A8_UINT,
+            1 => .r8_uint,
+            2 => .r8g8_uint,
+            4 => .r8g8b8a8_uint,
             else => unreachable,
         },
         i8 => switch (len) {
-            1 => c.VK_FORMAT_R8_SINT,
-            2 => c.VK_FORMAT_R8G8_SINT,
-            4 => c.VK_FORMAT_R8G8B8A8_SINT,
+            1 => .r8_sint,
+            2 => .r8g8_sint,
+            4 => .r8g8b8a8_sint,
             else => unreachable,
         },
         u16 => switch (len) {
-            1 => c.VK_FORMAT_R16_UINT,
-            2 => c.VK_FORMAT_R16G16_UINT,
-            4 => c.VK_FORMAT_R16G16B16A16_UINT,
+            1 => .r16_uint,
+            2 => .r16g16_uint,
+            4 => .r16g16b16a16_uint,
             else => unreachable,
         },
         i16 => switch (len) {
-            1 => c.VK_FORMAT_R16_SINT,
-            2 => c.VK_FORMAT_R16G16_SINT,
-            4 => c.VK_FORMAT_R16G16B16A16_SINT,
+            1 => .r16_sint,
+            2 => .r16g16_sint,
+            4 => .r16g16b16a16_sint,
             else => unreachable,
         },
         u32 => switch (len) {
-            1 => c.VK_FORMAT_R32_UINT,
-            2 => c.VK_FORMAT_R32G32_UINT,
-            4 => c.VK_FORMAT_R32G32B32A32_UINT,
+            1 => .r32_uint,
+            2 => .r32g32_uint,
+            4 => .r32g32b32a32_uint,
             else => unreachable,
         },
         i32 => switch (len) {
-            1 => c.VK_FORMAT_R32_SINT,
-            2 => c.VK_FORMAT_R32G32_SINT,
-            4 => c.VK_FORMAT_R32G32B32A32_SINT,
+            1 => .r32_sint,
+            2 => .r32g32_sint,
+            4 => .r32g32b32a32_sint,
             else => unreachable,
         },
         f32 => switch (len) {
-            1 => c.VK_FORMAT_R32_SFLOAT,
-            2 => c.VK_FORMAT_R32G32_SFLOAT,
-            4 => c.VK_FORMAT_R32G32B32A32_SFLOAT,
+            1 => .r32_sfloat,
+            2 => .r32g32_sfloat,
+            4 => .r32g32b32a32_sfloat,
             else => unreachable,
         },
         else => unreachable,

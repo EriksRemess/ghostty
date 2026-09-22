@@ -84,6 +84,8 @@ loca = "loca"
 # TinyIo
 tio = "tio"
 WRONLY = "WRONLY"
+# Vulkan level-of-detail fields
+lod = "lod"
 
 [type.po]
 extend-glob = ["*.po"]
