@@ -1,9 +1,8 @@
 //! Represents an offscreen Vulkan render target.
 //!
-//! texture is the color attachment. Every completed frame is copied to the
-//! host-visible readback buffer so CPU presentation is always available. If
-//! external-memory support is usable, the same frame is also copied to
-//! export_image, whose memory is exported to GTK as a dma-buf.
+//! texture is the color attachment. Frames use either export_image for
+//! DMA-BUF presentation or the host-visible readback buffer for CPU
+//! presentation. We only record the copy required by the active path.
 
 const Self = @This();
 
@@ -26,6 +25,11 @@ pub const Options = struct {
     width: usize,
     height: usize,
     format: vk.Format,
+};
+
+pub const Presentation = enum {
+    dmabuf,
+    memory,
 };
 
 context: *Context,
@@ -52,10 +56,12 @@ pub fn init(opts: Options) !Self {
     }, opts.width * opts.height * 4);
     errdefer readback.deinit();
 
-    const export_image: ?ExportImage = if (opts.context.supports_dmabuf)
+    const export_image: ?ExportImage = if (opts.context.dmabufEnabled())
         ExportImage.init(opts.context, opts.width, opts.height, opts.format) catch |err| fallback: {
             // Modifier support can differ by format even when all required
-            // extensions exist. Retain the guaranteed CPU fallback.
+            // extensions exist. Disable export for every swap-chain target so
+            // all subsequent frames consistently use the CPU fallback.
+            _ = opts.context.disableDmabuf();
             log.warn("DMA-BUF export image unavailable, using memory presentation err={}", .{err});
             break :fallback null;
         }
@@ -79,9 +85,14 @@ pub fn deinit(self: *Self) void {
     self.texture.deinit();
 }
 
-pub fn recordReadback(self: *const Self, command_buffer: vk.CommandBuffer) void {
-    // Both presentation paths consume the rendered attachment, so establish
-    // transfer visibility before recording either copy.
+pub fn usesDmabuf(self: *const Self) bool {
+    return self.export_image != null and self.context.dmabufEnabled();
+}
+
+/// Record only the transfer required by the active presentation path. Avoiding
+/// a host-visible copy on successful DMA-BUF frames is important on discrete
+/// GPUs, where that otherwise becomes a device-to-host transfer every frame.
+pub fn recordPresentation(self: *const Self, command_buffer: vk.CommandBuffer) Presentation {
     Texture.imageBarrier(
         self.context,
         command_buffer,
@@ -94,6 +105,25 @@ pub fn recordReadback(self: *const Self, command_buffer: vk.CommandBuffer) void 
         .general,
     );
 
+    if (self.usesDmabuf()) {
+        self.recordExport(command_buffer);
+        return .dmabuf;
+    } else {
+        self.recordReadback(command_buffer);
+        return .memory;
+    }
+}
+
+/// Populate the CPU fallback after a late DMA-BUF export failure. The frame's
+/// original submission has completed before present() calls this method, so a
+/// second transfer submission can safely consume the rendered texture.
+pub fn copyToReadback(self: *const Self) !void {
+    const command_buffer = try self.context.beginCommands();
+    self.recordReadback(command_buffer);
+    try self.context.submitCommands(command_buffer);
+}
+
+fn recordReadback(self: *const Self, command_buffer: vk.CommandBuffer) void {
     const region: vk.BufferImageCopy = .{
         .buffer_offset = 0,
         .buffer_row_length = 0,
@@ -119,62 +149,6 @@ pub fn recordReadback(self: *const Self, command_buffer: vk.CommandBuffer) void 
         @ptrCast(&region),
     );
 
-    if (self.export_image) |export_image| {
-        // The export image is deliberately separate: dma-buf-capable tiling
-        // and memory requirements need not match the optimal render target.
-        Texture.imageBarrier(
-            self.context,
-            command_buffer,
-            export_image.image,
-            .{ .memory_read_bit = true },
-            .{ .transfer_write_bit = true },
-            .{ .all_commands_bit = true },
-            .{ .transfer_bit = true },
-            .general,
-            .general,
-        );
-        const image_copy: vk.ImageCopy = .{
-            .src_subresource = .{
-                .aspect_mask = .{ .color_bit = true },
-                .mip_level = 0,
-                .base_array_layer = 0,
-                .layer_count = 1,
-            },
-            .src_offset = .{ .x = 0, .y = 0, .z = 0 },
-            .dst_subresource = .{
-                .aspect_mask = .{ .color_bit = true },
-                .mip_level = 0,
-                .base_array_layer = 0,
-                .layer_count = 1,
-            },
-            .dst_offset = .{ .x = 0, .y = 0, .z = 0 },
-            .extent = .{
-                .width = @intCast(self.width),
-                .height = @intCast(self.height),
-                .depth = 1,
-            },
-        };
-        self.context.device.cmdCopyImage(
-            command_buffer,
-            self.texture.image,
-            .general,
-            export_image.image,
-            .general,
-            @ptrCast(&image_copy),
-        );
-        Texture.imageBarrier(
-            self.context,
-            command_buffer,
-            export_image.image,
-            .{ .transfer_write_bit = true },
-            .{ .memory_read_bit = true },
-            .{ .transfer_bit = true },
-            .{ .bottom_of_pipe_bit = true },
-            .general,
-            .general,
-        );
-    }
-
     // Make the transfer visible to mapMemory after the submission fence.
     const barrier: vk.BufferMemoryBarrier = .{
         .src_access_mask = .{ .transfer_write_bit = true },
@@ -193,6 +167,64 @@ pub fn recordReadback(self: *const Self, command_buffer: vk.CommandBuffer) void 
         null,
         @ptrCast(&barrier),
         null,
+    );
+}
+
+fn recordExport(self: *const Self, command_buffer: vk.CommandBuffer) void {
+    const export_image = self.export_image orelse return;
+
+    // The export image is deliberately separate: DMA-BUF-capable tiling and
+    // memory requirements need not match the optimal render target.
+    Texture.imageBarrier(
+        self.context,
+        command_buffer,
+        export_image.image,
+        .{ .memory_read_bit = true },
+        .{ .transfer_write_bit = true },
+        .{ .all_commands_bit = true },
+        .{ .transfer_bit = true },
+        .general,
+        .general,
+    );
+    const image_copy: vk.ImageCopy = .{
+        .src_subresource = .{
+            .aspect_mask = .{ .color_bit = true },
+            .mip_level = 0,
+            .base_array_layer = 0,
+            .layer_count = 1,
+        },
+        .src_offset = .{ .x = 0, .y = 0, .z = 0 },
+        .dst_subresource = .{
+            .aspect_mask = .{ .color_bit = true },
+            .mip_level = 0,
+            .base_array_layer = 0,
+            .layer_count = 1,
+        },
+        .dst_offset = .{ .x = 0, .y = 0, .z = 0 },
+        .extent = .{
+            .width = @intCast(self.width),
+            .height = @intCast(self.height),
+            .depth = 1,
+        },
+    };
+    self.context.device.cmdCopyImage(
+        command_buffer,
+        self.texture.image,
+        .general,
+        export_image.image,
+        .general,
+        @ptrCast(&image_copy),
+    );
+    Texture.imageBarrier(
+        self.context,
+        command_buffer,
+        export_image.image,
+        .{ .transfer_write_bit = true },
+        .{ .memory_read_bit = true },
+        .{ .transfer_bit = true },
+        .{ .bottom_of_pipe_bit = true },
+        .general,
+        .general,
     );
 }
 
@@ -344,6 +376,14 @@ const ExportImage = struct {
         var fallback: ?u64 = null;
         for (modifiers) |value| {
             if (!value.drm_format_modifier_tiling_features.transfer_dst_bit) continue;
+            // GDK's plane array must describe every DRM memory plane. This
+            // backend currently exports a single fd/offset/stride, so reject
+            // modifiers with auxiliary compression planes.
+            if (value.drm_format_modifier_plane_count != 1) continue;
+            if (!context.consumerSupportsDmabuf(
+                drm_format_abgr8888,
+                value.drm_format_modifier,
+            )) continue;
             if (fallback == null) fallback = value.drm_format_modifier;
             if (value.drm_format_modifier == drm_format_mod_linear) return value.drm_format_modifier;
         }

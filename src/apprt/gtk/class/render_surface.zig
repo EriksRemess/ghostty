@@ -166,6 +166,15 @@ pub const RenderSurface = extern struct {
                             .{},
                         );
                         core.reportPresentationHealth(.unhealthy);
+                        if (core.renderer.disableDmabuf()) {
+                            // Vulkan can switch presentation paths immediately.
+                            // Request a replacement frame so the widget does not
+                            // remain blank or stale while the health report is
+                            // processed by the renderer thread.
+                            core.draw() catch |draw_err| {
+                                log.warn("error drawing DMA-BUF fallback frame err={}", .{draw_err});
+                            };
+                        }
                     },
 
                     else => log.warn("error building texture from frame err={}", .{err}),
@@ -314,6 +323,9 @@ pub const RenderSurface = extern struct {
     /// Build a `GdkDmabufTexture` from the present and set it as our
     /// current texture, unrefing any previous texture.
     fn rebuildDmabufTexture(self: *Self, frame: Dmabuf) !void {
+        var owns_frame = true;
+        errdefer if (owns_frame) frame.deinit();
+
         const priv = self.private();
         const widget = self.as(gtk.Widget);
         const display = widget.getDisplay();
@@ -346,6 +358,7 @@ pub const RenderSurface = extern struct {
         errdefer alloc.destroy(planes);
 
         planes.* = frame.planes;
+        owns_frame = false;
         errdefer planes.deinit();
 
         var err_: ?*glib.Error = null;

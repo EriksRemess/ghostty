@@ -103,7 +103,9 @@ pub fn init(opts: Options, width: usize, height: usize, data: ?[]const u8) Error
         .format = opts.format,
         .upload_format = opts.upload_format,
     };
-    errdefer self.deinit();
+    // The individual errdefers above retain ownership until this function
+    // returns successfully. Do not also call self.deinit() here: doing so on
+    // an initialization error would destroy every Vulkan handle twice.
     try self.initialize(data);
     return self;
 }
