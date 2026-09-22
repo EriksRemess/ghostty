@@ -10,6 +10,7 @@ const builtin = @import("builtin");
 const Allocator = std.mem.Allocator;
 const vk = @import("vulkan/api.zig").vk;
 
+const build_config = @import("../build_config.zig");
 const configpkg = @import("../config.zig");
 const font = @import("../font/main.zig");
 const rendererpkg = @import("../renderer.zig");
@@ -49,13 +50,22 @@ pub fn init(alloc: Allocator, opts: rendererpkg.Options) !Vulkan {
         @compileError("the Vulkan renderer currently supports Linux only");
     }
 
+    const consumer_formats = try queryConsumerDmabufFormats(alloc, opts);
+    defer if (consumer_formats) |formats| alloc.free(formats);
+
     return .{
         .alloc = alloc,
-        .context = try Context.init(alloc),
+        .context = try Context.init(alloc, consumer_formats),
         .blending = opts.config.blending,
         .surface_width = opts.size.screen.width,
         .surface_height = opts.size.screen.height,
     };
+}
+
+/// Stop exporting DMA-BUF frames after the presentation consumer rejects one.
+/// This is called from GTK's main thread, so Context stores the state atomically.
+pub fn disableDmabuf(self: *Vulkan) bool {
+    return self.context.disableDmabuf();
 }
 
 pub fn deinit(self: *Vulkan) void {
@@ -92,18 +102,53 @@ pub fn initTarget(self: *const Vulkan, width: usize, height: usize) !Target {
     });
 }
 
-pub fn present(self: *Vulkan, target: Target) !ExportedFrame {
-    if (target.exportDmabuf()) |dmabuf| return .{ .dmabuf = dmabuf } else |err| {
-        // A device may advertise the extensions but still reject the selected
-        // format/modifier. Keep presentation functional in that case.
-        std.log.scoped(.vulkan).warn("DMA-BUF presentation failed, using memory fallback err={}", .{err});
+pub fn present(self: *Vulkan, target: Target, presentation: Target.Presentation) !ExportedFrame {
+    if (presentation == .dmabuf and target.usesDmabuf()) {
+        if (target.exportDmabuf()) |dmabuf| return .{ .dmabuf = dmabuf } else |err| {
+            // Export failed after this frame was rendered for DMA-BUF. Disable
+            // that path and perform the readback now so this frame still has a
+            // usable presentation instead of leaving GTK on stale contents.
+            _ = self.context.disableDmabuf();
+            std.log.scoped(.vulkan).warn("DMA-BUF presentation failed, using memory fallback err={}", .{err});
+            try target.copyToReadback();
+        }
+    } else if (presentation == .dmabuf) {
+        // GTK may disable DMA-BUF while this frame is in flight after an older
+        // import fails. Its command buffer contains only the export copy, so
+        // populate readback before returning the now-selected memory frame.
+        try target.copyToReadback();
     }
+
     return .{ .memory = .{
         .width = @intCast(target.width),
         .height = @intCast(target.height),
         .pixels = try target.readPixelsAlloc(self.alloc),
         .alloc = self.alloc,
     } };
+}
+
+/// Snapshot the format/modifier pairs accepted by the GDK display while the
+/// renderer is initialized on the main thread. The Vulkan render thread can
+/// then negotiate export images without calling into the apprt.
+fn queryConsumerDmabufFormats(
+    alloc: Allocator,
+    opts: rendererpkg.Options,
+) !?[]Context.DmabufFormat {
+    return switch (comptime build_config.app_runtime) {
+        .gtk => gtk: {
+            const gtk = @import("gtk");
+            const display = opts.rt_surface.gobj().as(gtk.Widget).getDisplay();
+            const formats = display.getDmabufFormats();
+            const result = try alloc.alloc(Context.DmabufFormat, formats.getNFormats());
+            errdefer alloc.free(result);
+
+            for (result, 0..) |*result_format, i| {
+                formats.getFormat(i, &result_format.fourcc, &result_format.modifier);
+            }
+            break :gtk result;
+        },
+        else => null,
+    };
 }
 
 pub const ExportedFrame = union(enum) {

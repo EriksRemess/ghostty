@@ -54,7 +54,7 @@ pub inline fn renderPass(self: *const Self, attachments: []const RenderPass.Opti
 
 pub fn complete(self: *Self, sync: bool) void {
     _ = sync;
-    self.target.recordReadback(self.command_buffer);
+    const presentation = self.target.recordPresentation(self.command_buffer);
     self.context.submitCommands(self.command_buffer) catch |err| {
         log.warn("failed to submit frame err={}", .{err});
         self.context.device.destroyDescriptorPool(self.descriptor_pool, null);
@@ -63,7 +63,7 @@ pub fn complete(self: *Self, sync: bool) void {
     };
     self.context.device.destroyDescriptorPool(self.descriptor_pool, null);
 
-    const frame = self.renderer.api.present(self.target.*) catch |err| {
+    const frame = self.renderer.api.present(self.target.*, presentation) catch |err| {
         log.warn("failed to present frame err={}", .{err});
         self.renderer.frameCompleted(.unhealthy);
         return;

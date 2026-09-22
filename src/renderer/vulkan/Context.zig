@@ -20,9 +20,18 @@ command_pool: vk.CommandPool,
 descriptor_set_layout: vk.DescriptorSetLayout,
 pipeline_layout: vk.PipelineLayout,
 memory_properties: vk.PhysicalDeviceMemoryProperties,
-supports_dmabuf: bool,
+dmabuf_enabled: std.atomic.Value(bool),
+consumer_dmabuf_formats: ?[]DmabufFormat,
 alloc: std.mem.Allocator,
 deferred_buffers: ?*DeferredBuffer = null,
+
+/// A format/modifier pair accepted by the presentation consumer. Vulkan can
+/// export many combinations that GTK cannot import, so targets only select
+/// modifiers present in this list.
+pub const DmabufFormat = struct {
+    fourcc: u32,
+    modifier: u64,
+};
 
 pub const DeferredBuffer = struct {
     buffer: vk.Buffer,
@@ -30,9 +39,15 @@ pub const DeferredBuffer = struct {
     next: ?*DeferredBuffer = null,
 };
 
-pub fn init(alloc: std.mem.Allocator) !*Self {
+pub fn init(alloc: std.mem.Allocator, consumer_dmabuf_formats: ?[]const DmabufFormat) !*Self {
     const self = try alloc.create(Self);
     errdefer alloc.destroy(self);
+
+    const owned_consumer_formats = if (consumer_dmabuf_formats) |formats|
+        try alloc.dupe(DmabufFormat, formats)
+    else
+        null;
+    errdefer if (owned_consumer_formats) |formats| alloc.free(formats);
 
     const app_info: vk.ApplicationInfo = .{
         .p_application_name = "Ghostty",
@@ -61,8 +76,21 @@ pub fn init(alloc: std.mem.Allocator) !*Self {
     var fallback_family: u32 = 0;
 
     for (physical_devices) |candidate| {
-        const family = findGraphicsQueue(instance, alloc, candidate) catch continue;
         const props = instance.getPhysicalDeviceProperties(candidate);
+        if (props.api_version < vk.API_VERSION_1_3.toU32()) continue;
+
+        // Dynamic rendering is optional even when the implementation exposes
+        // Vulkan 1.3, so reject devices that cannot provide the feature before
+        // applying the discrete-GPU preference.
+        var dynamic_rendering_support: vk.PhysicalDeviceDynamicRenderingFeatures = .{};
+        var features: vk.PhysicalDeviceFeatures2 = .{
+            .p_next = &dynamic_rendering_support,
+            .features = .{},
+        };
+        instance.getPhysicalDeviceFeatures2(candidate, &features);
+        if (dynamic_rendering_support.dynamic_rendering != .true) continue;
+
+        const family = findGraphicsQueue(instance, alloc, candidate) catch continue;
 
         if (fallback_device == .null_handle) {
             fallback_device = candidate;
@@ -176,7 +204,8 @@ pub fn init(alloc: std.mem.Allocator) !*Self {
         .descriptor_set_layout = descriptor_set_layout,
         .pipeline_layout = pipeline_layout,
         .memory_properties = instance.getPhysicalDeviceMemoryProperties(physical_device),
-        .supports_dmabuf = supports_dmabuf,
+        .dmabuf_enabled = .init(supports_dmabuf),
+        .consumer_dmabuf_formats = owned_consumer_formats,
         .alloc = alloc,
     };
     return self;
@@ -190,9 +219,34 @@ pub fn deinit(self: *Self, alloc: std.mem.Allocator) void {
     self.device.destroyCommandPool(self.command_pool, null);
     self.device.destroyDevice(null);
     self.instance.destroyInstance(null);
+    if (self.consumer_dmabuf_formats) |formats| alloc.free(formats);
     alloc.destroy(self.device_wrapper);
     alloc.destroy(self.instance_wrapper);
     alloc.destroy(self);
+}
+
+/// Whether new frames should use the DMA-BUF presentation path. GTK may
+/// disable this after an import failure, in which case every target switches
+/// to its CPU readback buffer on the next frame.
+pub fn dmabufEnabled(self: *const Self) bool {
+    return self.dmabuf_enabled.load(.seq_cst);
+}
+
+/// Disable DMA-BUF presentation and return whether this call changed state.
+pub fn disableDmabuf(self: *Self) bool {
+    return self.dmabuf_enabled.swap(false, .seq_cst);
+}
+
+pub fn consumerSupportsDmabuf(self: *const Self, fourcc: u32, modifier: u64) bool {
+    return consumerSupportsDmabufFormats(self.consumer_dmabuf_formats, fourcc, modifier);
+}
+
+fn consumerSupportsDmabufFormats(formats_: ?[]const DmabufFormat, fourcc: u32, modifier: u64) bool {
+    const formats = formats_ orelse return true;
+    for (formats) |format| {
+        if (format.fourcc == fourcc and format.modifier == modifier) return true;
+    }
+    return false;
 }
 
 pub fn memoryType(self: *const Self, bits: u32, flags: vk.MemoryPropertyFlags) !u32 {
@@ -230,6 +284,8 @@ pub fn submitCommands(self: *Self, command_buffer: vk.CommandBuffer) !void {
     };
     // Resource replacement defers old buffers until this fence signals. This
     // keeps handles referenced by the just-recorded frame alive on the GPU.
+    // GTK's DMA-BUF texture API has no acquire-fence input, so presentation
+    // must also wait here rather than exposing an image still being written.
     try self.device.queueSubmit(self.queue, @ptrCast(&submit_info), fence);
     _ = try self.device.waitForFences(@ptrCast(&fence), .true, std.math.maxInt(u64));
     self.device.freeCommandBuffers(self.command_pool, @ptrCast(&command_buffer));
@@ -286,4 +342,16 @@ fn queryDeviceExtensions(instance: vk.InstanceProxy, alloc: std.mem.Allocator, d
         if (std.mem.eql(u8, name, vk.extensions.ext_image_drm_format_modifier.name)) support.image_drm_format_modifier = true;
     }
     return support;
+}
+
+test "DMA-BUF consumer formats require an exact pair" {
+    const formats = [_]DmabufFormat{
+        .{ .fourcc = 1, .modifier = 10 },
+        .{ .fourcc = 2, .modifier = 20 },
+    };
+
+    try std.testing.expect(consumerSupportsDmabufFormats(&formats, 1, 10));
+    try std.testing.expect(!consumerSupportsDmabufFormats(&formats, 1, 20));
+    try std.testing.expect(!consumerSupportsDmabufFormats(&formats, 3, 10));
+    try std.testing.expect(consumerSupportsDmabufFormats(null, 3, 30));
 }

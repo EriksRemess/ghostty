@@ -1032,6 +1032,15 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             return self.latest_frame.take(global.io());
         }
 
+        /// Disable DMA-BUF presentation after the apprt rejects an exported
+        /// frame. Backends without an adaptive fallback leave this as a no-op.
+        pub fn disableDmabuf(self: *Self) bool {
+            if (comptime @hasDecl(GraphicsAPI, "disableDmabuf")) {
+                return self.api.disableDmabuf();
+            }
+            return false;
+        }
+
         fn displayLinkCallback(
             _: *macos.video.DisplayLink,
             ud: ?*xev.Async,
